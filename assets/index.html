@@ -390,7 +390,7 @@ function renderConcept(c, panel) {
       <span class="badge badge-outline font-mono text-xs">${esc(c.id)}</span>
       ${c.hierarchy ? `<span class="badge badge-warning badge-outline text-xs">${esc(c.hierarchy)}</span>` : ""}
       ${c.children_count ? `<span class="badge badge-ghost text-xs">${c.children_count} children</span>` : ""}
-      ${c.descendants_count ? `<span class="badge badge-primary badge-outline text-xs">${c.descendants_count.toLocaleString()} descendants</span>` : ""}
+      ${c.descendants_count !== undefined ? `<span class="badge badge-primary badge-outline text-xs">${Math.max(0, c.descendants_count - 1).toLocaleString()} descendants</span>` : ""}
     </div>`;
 
   if (synonyms.length) {
