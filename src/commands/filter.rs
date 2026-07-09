@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Marcus Baw and Baw Medical Ltd
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `sct filter` - filter a SNOMED CT NDJSON file and remap GTINs to kept ancestor concepts.
+//! `sct filter` - filter a SNOMED CT NDJSON file, collapse hierarchy, and remap GTINs.
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufWriter, Write};
 use std::path::PathBuf;
 
-use crate::schema::ConceptRecord;
+use crate::schema::{ConceptRecord, ConceptRef};
 
 #[derive(Parser, Debug)]
 pub struct Args {
@@ -33,9 +33,7 @@ pub struct Args {
     #[arg(long)]
     pub db: Option<PathBuf>,
 
-    /// Path to a CSV/TSV file mapping GTINs to concepts (format: gtin,concept_id).
-    /// If provided, GTINs mapping to filtered-out concepts (e.g. AMPPs)
-    /// will be remapped to their nearest kept ancestor (e.g. VMP/VTM).
+    /// Path to a CSV/TSV file mapping GTINs to concepts (format: gtin,concept_id) (optional).
     #[arg(long)]
     pub gtin_map: Option<PathBuf>,
 }
@@ -98,10 +96,24 @@ pub fn run(args: Args) -> Result<()> {
         concepts.insert(record.id.clone(), record);
     }
 
-    // 3. If a GTIN map is provided, load and remap the GTINs
+    // 3. Perform automatic GTIN remapping of GTINs already in the NDJSON,
+    // and optionally layer custom mappings from the --gtin-map file.
     let mut gtin_remaps: HashMap<String, Vec<String>> = HashMap::new();
+
+    // Trace existing GTINs from filtered-out concepts
+    for (id, record) in &concepts {
+        if !record.gtin_codes.is_empty() && !kept_ids.contains(id) {
+            if let Some(target_id) = find_kept_ancestor(id, &parents_map, &kept_ids) {
+                gtin_remaps
+                    .entry(target_id)
+                    .or_default()
+                    .extend(record.gtin_codes.clone());
+            }
+        }
+    }
+
     if let Some(gtin_map_path) = &args.gtin_map {
-        eprintln!("Loading and remapping GTINs...");
+        eprintln!("Loading and remapping custom GTINs...");
         let file = std::fs::File::open(gtin_map_path)
             .with_context(|| format!("opening GTIN map file {}", gtin_map_path.display()))?;
         let mut rdr = csv::ReaderBuilder::new()
@@ -125,19 +137,39 @@ pub fn run(args: Args) -> Result<()> {
 
             total_gtins += 1;
 
-            // Find the nearest ancestor of concept_id that is in kept_ids
             if let Some(target_id) = find_kept_ancestor(&concept_id, &parents_map, &kept_ids) {
                 gtin_remaps.entry(target_id).or_default().push(gtin);
                 mapped_gtins += 1;
             }
         }
         eprintln!(
-            "Mapped {} of {} GTINs to kept concepts.",
+            "Mapped {} of {} custom GTINs to kept concepts.",
             mapped_gtins, total_gtins
         );
     }
 
-    // 4. Filter concepts and apply GTIN mappings
+    // 4. Collapse the parent links of kept concepts and build new children count map
+    eprintln!("Collapsing hierarchy and updating links...");
+    let mut kept_parents_map: HashMap<String, Vec<String>> = HashMap::new();
+    let mut children_counts: HashMap<String, usize> = HashMap::new();
+
+    for id in &kept_ids {
+        if let Some(record) = concepts.get(id) {
+            let mut new_parents = Vec::new();
+            for p in &record.parents {
+                if let Some(ancestor_id) = find_kept_ancestor(&p.id, &parents_map, &kept_ids) {
+                    new_parents.push(ancestor_id.clone());
+                    // Increment the children count for the kept parent
+                    *children_counts.entry(ancestor_id).or_default() += 1;
+                }
+            }
+            new_parents.sort();
+            new_parents.dedup();
+            kept_parents_map.insert(id.clone(), new_parents);
+        }
+    }
+
+    // 5. Filter concepts, assign remapped parents/GTINs/children counts, and write output
     eprintln!("Filtering and writing output NDJSON...");
     let out_file = std::fs::File::create(&args.output)
         .with_context(|| format!("creating output file {}", args.output.display()))?;
@@ -151,7 +183,6 @@ pub fn run(args: Args) -> Result<()> {
     let mut kept_count = 0;
     let initial_count = concepts.len();
 
-    // Iterate in sorted order of concept IDs to preserve stable NDJSON ordering
     let mut concept_ids: Vec<String> = concepts.keys().cloned().collect();
     concept_ids.sort_by(|a, b| {
         let a_num = a.parse::<u64>().ok();
@@ -165,10 +196,32 @@ pub fn run(args: Args) -> Result<()> {
     for id in &concept_ids {
         if kept_ids.contains(id) {
             let mut record = concepts.remove(id).unwrap();
-            // Assign remapped GTINs
-            if let Some(gtins) = gtin_remaps.remove(id) {
-                record.gtin_codes = gtins;
+
+            // Assign remapped parent ConceptRefs
+            if let Some(parent_ids) = kept_parents_map.remove(id) {
+                record.parents = parent_ids
+                    .into_iter()
+                    .map(|pid| ConceptRef {
+                        fsn: concepts
+                            .get(&pid)
+                            .or(record.id.eq(&pid).then_some(&record))
+                            .map(|c| c.fsn.clone())
+                            .unwrap_or_default(),
+                        id: pid,
+                    })
+                    .collect();
             }
+
+            // Assign recalculated children count
+            record.children_count = children_counts.remove(id).unwrap_or(0);
+
+            // Assign remapped GTINs
+            if let Some(mut gtins) = gtin_remaps.remove(id) {
+                record.gtin_codes.append(&mut gtins);
+                record.gtin_codes.sort();
+                record.gtin_codes.dedup();
+            }
+
             let serialized = serde_json::to_string(&record)?;
             writer.write_all(serialized.as_bytes())?;
             writer.write_all(b"\n")?;
@@ -179,7 +232,7 @@ pub fn run(args: Args) -> Result<()> {
 
     let output_len = std::fs::metadata(&args.output)?.len();
 
-    // 5. Print space savings summary
+    // 6. Print space savings summary
     println!("\nDatabase Filtering Summary");
     println!("==========================");
     println!(
